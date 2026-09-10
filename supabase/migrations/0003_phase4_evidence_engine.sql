@@ -48,7 +48,19 @@ alter table public.evidence_gaps add constraint evidence_gaps_gap_type_check che
 ));
 
 alter table public.evidence_gaps drop constraint if exists evidence_gaps_severity_check;
-alter table public.evidence_gaps add constraint evidence_gaps_severity_check
+
+alter table public.evidence_gaps
+  add column if not exists severity text;
+
+update public.evidence_gaps
+set severity = importance
+where severity is null;
+
+alter table public.evidence_gaps
+  alter column severity set not null;
+
+alter table public.evidence_gaps
+  add constraint evidence_gaps_severity_check
   check (severity in ('low', 'medium', 'high', 'critical'));
 
 -- ---------------------------------------------------------------------
@@ -72,13 +84,11 @@ alter table public.evidence_conflicts add constraint evidence_conflicts_severity
 -- never silently discard a founder's review of a conflict.
 -- ---------------------------------------------------------------------
 alter table public.evidence_gaps
-  add column if not exists auto_generated boolean not null default true,
-  add column if not exists severity text;
-
-update public.evidence_gaps set severity = importance where severity is null;
-alter table public.evidence_gaps alter column severity set not null;
-alter table public.evidence_gaps drop constraint if exists evidence_gaps_severity_check2;
-alter table public.evidence_gaps add constraint evidence_gaps_severity_check2
+  add column if not exists auto_generated boolean not null default true;
+alter table public.evidence_gaps
+  drop constraint if exists evidence_gaps_severity_check2;
+alter table public.evidence_gaps
+  add constraint evidence_gaps_severity_check2
   check (severity in ('low', 'medium', 'high', 'critical'));
 alter table public.evidence_conflicts
   add column if not exists auto_generated boolean not null default true;

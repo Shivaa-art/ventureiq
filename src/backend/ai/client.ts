@@ -10,19 +10,15 @@
 // evidenceRequirementGenerator, evidenceClassifier, research planner)
 // calls. It forces JSON-only output from whichever provider is
 // configured, then validates that output against a caller-supplied
-// Zod schema before returning it — nothing downstream of this
-// function ever sees unvalidated model output, regardless of which
-// provider produced it. This is what keeps the LLM confined to
-// proposing content (a hypothesis wording, an evidence summary)
-// rather than deciding facts (a final confidence number, a hypothesis
-// status) — those are computed deterministically elsewhere
-// (src/backend/scoring/, src/backend/validation/) and never asked of
-// the model at all.
+// Zod schema before returning it.
 //
-// Services never import the Anthropic or Gemini SDK directly — only
-// this file and the two provider implementations
-// (src/backend/ai/providers/*) do. Switching AI_PROVIDER is a
-// configuration change, not a code change.
+// IMPORTANT:
+// - No fabricated fallback data is ever returned.
+// - Invalid JSON is retried once with a stricter JSON-only prompt.
+// - Markdown JSON fences are supported.
+// - Accidental text surrounding a JSON object is handled.
+// - Zod validation remains mandatory before data reaches downstream
+//   services or the database.
 // =====================================================================
 
 import type { ZodType } from "zod";
@@ -41,15 +37,21 @@ if (typeof window !== "undefined") {
 let provider: AIProvider | null = null;
 
 /**
- * Gemini is the default (free-tier friendly for development).
- * AI_PROVIDER=anthropic switches to Anthropic. Any other/unset value
- * falls back to Gemini rather than failing outright, since Gemini
- * must be the default per project configuration.
+ * Gemini is the default provider.
+ *
+ * AI_PROVIDER=anthropic switches to Anthropic.
+ * Any other/unset value falls back to Gemini.
  */
 export function getAIProvider(): AIProvider {
   if (provider) return provider;
+
   const configured = (process.env.AI_PROVIDER ?? "gemini").toLowerCase();
-  provider = configured === "anthropic" ? new AnthropicProvider() : new GeminiProvider();
+
+  provider =
+    configured === "anthropic"
+      ? new AnthropicProvider()
+      : new GeminiProvider();
+
   return provider;
 }
 
@@ -69,16 +71,35 @@ export interface GenerateStructuredOptions {
   userPrompt: string;
   model?: string;
   maxTokens?: number;
-  /** Bumped whenever the prompt/schema pairing changes, so stored records are traceable to how they were produced. */
+
+  /**
+   * Bumped whenever the prompt/schema pairing changes,
+   * so stored records remain traceable.
+   */
   promptVersion: string;
 }
 
 /**
- * Calls the currently-configured provider with a JSON-only system
- * instruction, then parses and validates the response against
- * `schema`. Throws StructuredGenerationError (never returns a
- * partially-trusted object, never fabricates a fallback) if the
- * provider call fails or its output does not conform.
+ * Calls the configured AI provider and requires a valid structured result.
+ *
+ * Flow:
+ *
+ * Provider
+ *    ↓
+ * JSON response
+ *    ↓
+ * JSON extraction
+ *    ↓
+ * JSON.parse()
+ *    ↓
+ * Zod validation
+ *    ↓
+ * validated data
+ *
+ * If the first response cannot be parsed or validated, the model is
+ * called one additional time with a stricter JSON-only instruction.
+ *
+ * No fallback/fabricated data is ever returned.
  */
 export async function generateStructured<T>(
   schema: ZodType<T>,
@@ -88,6 +109,10 @@ export async function generateStructured<T>(
 
   let text: string;
   let model: string;
+
+  // ================================================================
+  // FIRST AI REQUEST
+  // ================================================================
   try {
     const result = await ai.generateText({
       systemPrompt: options.systemPrompt,
@@ -95,43 +120,214 @@ export async function generateStructured<T>(
       maxTokens: options.maxTokens ?? 2000,
       model: options.model,
     });
+
     text = result.text;
     model = result.model;
   } catch (err) {
-    // AIProviderError already carries a sanitized, non-secret-leaking
-    // message (see providers/*.ts) — safe to surface via
-    // StructuredGenerationError.message to callers/UI.
     if (err instanceof AIProviderError) {
       throw new StructuredGenerationError(err.message, "", err);
     }
+
     throw new StructuredGenerationError(
-      err instanceof Error ? err.message : "AI provider request failed for an unknown reason.",
+      err instanceof Error
+        ? err.message
+        : "AI provider request failed for an unknown reason.",
       "",
       err,
     );
   }
 
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(stripCodeFences(text));
-  } catch (cause) {
-    throw new StructuredGenerationError("Model output was not valid JSON.", text, cause);
+  // ================================================================
+  // FIRST PARSE + VALIDATION ATTEMPT
+  // ================================================================
+  const firstAttempt = parseAndValidate(schema, text);
+
+  if (firstAttempt.success) {
+    return {
+      data: firstAttempt.data,
+      model,
+      promptVersion: options.promptVersion,
+    };
   }
 
-  const result = schema.safeParse(parsedJson);
-  if (!result.success) {
+  // ================================================================
+  // SECOND AI REQUEST
+  //
+  // Gemini can occasionally return malformed JSON or harmless
+  // surrounding text even when application/json is requested.
+  //
+  // We retry once with an explicitly reinforced JSON-only instruction.
+  // ================================================================
+  try {
+    const retryResult = await ai.generateText({
+      systemPrompt: `${options.systemPrompt}
+
+IMPORTANT OUTPUT REQUIREMENT:
+Return ONLY one valid JSON object.
+
+Do not use Markdown.
+Do not use code fences.
+Do not write \`\`\`json.
+Do not add explanations before the JSON.
+Do not add explanations after the JSON.
+Do not include comments.
+Do not include trailing commas.
+
+The complete response must be directly parseable by JSON.parse().`,
+
+      userPrompt: `${options.userPrompt}
+
+STRICT JSON OUTPUT:
+Return exactly one valid JSON object.
+Return JSON only.
+No Markdown.
+No code fences.
+No explanation outside the JSON object.
+The complete response must be directly parseable by JSON.parse().`,
+
+      maxTokens: options.maxTokens ?? 2000,
+      model: options.model,
+    });
+
+    const retryAttempt = parseAndValidate(schema, retryResult.text);
+
+    if (retryAttempt.success) {
+      return {
+        data: retryAttempt.data,
+        model: retryResult.model,
+        promptVersion: options.promptVersion,
+      };
+    }
+
     throw new StructuredGenerationError(
-      `Model output failed schema validation: ${result.error.message}`,
+      retryAttempt.error,
+      retryResult.text,
+      retryAttempt.cause,
+    );
+  } catch (err) {
+    if (err instanceof StructuredGenerationError) {
+      throw err;
+    }
+
+    throw new StructuredGenerationError(
+      err instanceof Error
+        ? err.message
+        : "Structured AI generation failed after retry.",
       text,
-      result.error,
+      err,
     );
   }
-
-  return { data: result.data, model, promptVersion: options.promptVersion };
 }
 
-function stripCodeFences(text: string): string {
+/**
+ * Parses JSON and validates it against the caller-provided Zod schema.
+ */
+function parseAndValidate<T>(
+  schema: ZodType<T>,
+  text: string,
+):
+  | { success: true; data: T }
+  | {
+      success: false;
+      error: string;
+      cause?: unknown;
+    } {
+  const cleaned = extractJsonObject(text);
+
+  let parsedJson: unknown;
+
+  // ================================================================
+  // JSON PARSING
+  // ================================================================
+  try {
+    parsedJson = JSON.parse(cleaned);
+  } catch (cause) {
+    return {
+      success: false,
+      error: "Model output was not valid JSON.",
+      cause,
+    };
+  }
+
+  // ================================================================
+  // ZOD VALIDATION
+  // ================================================================
+  const result = schema.safeParse(parsedJson);
+
+  if (!result.success) {
+    return {
+      success: false,
+      error: `Model output failed schema validation: ${result.error.message}`,
+      cause: result.error,
+    };
+  }
+
+  return {
+    success: true,
+    data: result.data,
+  };
+}
+
+/**
+ * Extracts a JSON object from common LLM response formats.
+ *
+ * Handles:
+ *
+ * 1. Pure JSON
+ *
+ * {
+ *   "assumptions": []
+ * }
+ *
+ * 2. Markdown JSON fences
+ *
+ * ```json
+ * {
+ *   "assumptions": []
+ * }
+ * ```
+ *
+ * 3. Accidental surrounding text
+ *
+ * Here is the JSON:
+ * {
+ *   "assumptions": []
+ * }
+ */
+function extractJsonObject(text: string): string {
   const trimmed = text.trim();
-  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
-  return fenced ? fenced[1] : trimmed;
+
+  // ---------------------------------------------------------------
+  // Case 1: Already pure JSON
+  // ---------------------------------------------------------------
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    return trimmed;
+  }
+
+  // ---------------------------------------------------------------
+  // Case 2: Markdown code fence
+  // ---------------------------------------------------------------
+  const fenced = trimmed.match(
+    /^```(?:json)?\s*([\s\S]*?)\s*```$/i,
+  );
+
+  if (fenced?.[1]) {
+    return fenced[1].trim();
+  }
+
+  // ---------------------------------------------------------------
+  // Case 3: JSON surrounded by accidental model text
+  // ---------------------------------------------------------------
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    return trimmed.slice(firstBrace, lastBrace + 1);
+  }
+
+  // ---------------------------------------------------------------
+  // Case 4: Return original text so JSON.parse() produces the
+  // correct structured-generation error.
+  // ---------------------------------------------------------------
+  return trimmed;
 }
